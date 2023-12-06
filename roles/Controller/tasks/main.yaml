@@ -1,0 +1,268 @@
+---
+- name: Install Keystone and Apache packages
+  become: true
+  apt:
+    name:
+      - keystone
+      - apache2
+      - libapache2-mod-wsgi-py3
+    state: present
+
+- name: Set admin password
+  set_fact:
+    admin_pass: "123"
+
+- name: Set Keystone database password variable
+  set_fact:
+    keystone_dbpass: "123"
+
+- name: sourcing admin
+  command: source /home/cserver/admin-openrc
+  failed_when: false
+  no_log: true
+
+- name: Identity service database
+  command: su -s /bin/sh -c "keystone-manage db_sync" keystone
+  failed_when: false
+  no_log: true
+
+- name: initialize fernet repositories
+  command: keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+  failed_when: false
+  no_log: true
+
+- name: initialize fernet repositories
+  command: keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+  failed_when: false
+  no_log: true
+
+- name: Identity service database
+  become: true
+  command: keystone-manage bootstrap --bootstrap-password ADMIN_PASS \
+           --bootstrap-admin-url http://controller:5000/v3/ \
+           --bootstrap-internal-url http://controller:5000/v3/ \
+           --bootstrap-public-url http://controller:5000/v3/ \
+           --bootstrap-region-id RegionOne
+  failed_when: false
+  no_log: true
+
+- name: Configure Keystone database access
+  lineinfile:
+    path: /etc/keystone/keystone.conf
+    line: "{{ item }}"
+  loop:
+    - "[database]"
+    - "connection = mysql+pymysql://keystone:{{ keystone_dbpass }}@controller/keystone"
+  notify: Restart Apache
+
+- name: Comment out other database connection options
+  replace:
+    path: /etc/keystone/keystone.conf
+    regexp: '^connection.*$'
+    replace: '# connection = ...'
+
+- name: Configure Fernet token provider
+  lineinfile:
+    path: /etc/keystone/keystone.conf
+    line: "[token]\nprovider = fernet"
+
+- name: Configure Apache HTTP server
+  lineinfile:
+    path: /etc/apache2/apache2.conf
+    line: "ServerName controller"
+  notify: Restart Apache
+
+- name: Restart Apache service
+  service:
+    name: apache2
+    state: restarted
+  become: true
+
+- name: Configure administrative account
+  command: |
+    echo "export OS_USERNAME=admin" >> /etc/profile
+    echo "export OS_PASSWORD={{ admin_pass }}" >> /etc/profile
+    echo "export OS_PROJECT_NAME=admin" >> /etc/profile
+    echo "export OS_USER_DOMAIN_NAME=Default" >> /etc/profile
+    echo "export OS_PROJECT_DOMAIN_NAME=Default" >> /etc/profile
+    echo "export OS_AUTH_URL=http://controller:35357/v3" >> /etc/profile
+    echo "export OS_IDENTITY_API_VERSION=3" >> /etc/profile
+  become: true
+
+
+
+
+- name: Install Glance package
+  apt:
+    name: glance
+    state: present
+
+- name: Configure glance-api.conf
+  blockinfile:
+    path: /etc/glance/glance-api.conf
+    block: |
+      [database]
+      connection = mysql+pymysql://glance:GLANCE_DBPASS@controller/glance
+
+      [keystone_authtoken]
+      www_authenticate_uri  = http://192.168.56.105:5000
+      auth_url = http://192.168.56.105:5000
+      memcached_servers = 192.168.56.105:11211
+      auth_type = password
+      project_domain_name = Default
+      user_domain_name = Default
+      project_name = service
+      username = glance
+      password = GLANCE_PASS
+
+      [paste_deploy]
+      flavor = keystone
+
+      # Comment out or remove any other options in the [keystone_authtoken] section.
+
+      [glance_store]
+      default_backend = fs
+
+      [fs]
+      filesystem_store_datadir = /var/lib/glance/images/
+
+      [oslo_limit]
+      auth_url = http://192.168.56.105:5000
+      auth_type = password
+      user_domain_id = default
+      username = glance
+      system_scope = all
+      password = GLANCE_PASS
+      endpoint_id = 340be3625e9b4239a6415d034e98aace
+      region_name = RegionOne
+
+      # Replace GLANCE_PASS with the password you chose for the glance user.
+
+      [DEFAULT]
+      use_keystone_limits = True
+  become: true
+
+
+
+- name: Restart Glance service
+  service:
+    name: glance-api
+    state: restarted
+
+- name: Install Nova packages
+  apt:
+    name: "{{ item }}"
+    state: present
+  with_items:
+    - nova-api
+    - nova-conductor
+    - nova-novncproxy
+    - nova-scheduler
+
+- name: Configure nova.conf
+  blockinfile:
+    path: /etc/nova/nova.conf
+    block: |
+      [api_database]
+      connection = mysql+pymysql://nova:NOVA_DBPASS@Controller/nova_api
+
+      [database]
+      connection = mysql+pymysql://nova:NOVA_DBPASS@Controller/nova
+
+      [DEFAULT]
+      transport_url = rabbit://openstack:RABBIT_PASS@Controller:5672/
+
+      [api]
+      auth_strategy = keystone
+
+      [keystone_authtoken]
+      www_authenticate_uri = http://controller:5000/
+      auth_url = http://Controller:5000/
+      memcached_servers = Controller:11211
+      auth_type = password
+      project_domain_name = Default
+      user_domain_name = Default
+      project_name = service
+      username = nova
+      password = NOVA_PASS
+
+      [service_user]
+      send_service_user_token = true
+      auth_url = https://Controller/identity
+      auth_strategy = keystone
+      auth_type = password
+      project_domain_name = Default
+      project_name = service
+      user_domain_name = Default
+      username = nova
+      password = NOVA_PASS
+
+      [DEFAULT]
+      my_ip = 10.0.0.11
+
+      [vnc]
+      enabled = true
+      server_listen = $my_ip
+      server_proxyclient_address = $my_ip
+
+      [glance]
+      api_servers = http://Controller:9292
+
+      [oslo_concurrency]
+      lock_path = /var/lib/nova/tmp
+  become: true
+
+- name: Remove log_dir option from nova.conf
+  replace:
+    path: /etc/nova/nova.conf
+    regexp: '^log_dir.*$'
+    replace: ''
+  become: true
+
+- name: Configure placement section in nova.conf
+  blockinfile:
+    path: /etc/nova/nova.conf
+    block: |
+      [placement]
+      region_name = RegionOne
+      project_domain_name = Default
+      project_name = service
+      auth_type = password
+      user_domain_name = Default
+      auth_url = http://Controller:5000/v3
+      username = placement
+      password = PLACEMENT_PASS
+  become: true
+
+- name: Populate nova-api database
+  command: "su -s /bin/sh -c 'nova-manage api_db sync' nova"
+  become: true
+
+- name: Register cell0 database
+  command: "su -s /bin/sh -c 'nova-manage cell_v2 map_cell0' nova"
+  become: true
+
+- name: Create cell1 cell
+  command: "su -s /bin/sh -c 'nova-manage cell_v2 create_cell --name=cell1 --verbose' nova"
+  become: true
+  failed_when: false
+  no_log: true
+
+
+- name: Populate nova database
+  command: "su -s /bin/sh -c 'nova-manage db sync' nova"
+  become: true
+
+- name: Verify nova cell0 and cell1 registration
+  command: "su -s /bin/sh -c 'nova-manage cell_v2 list_cells' nova"
+  become: true
+
+- name: Restart Nova services
+  service:
+    name: "{{ item }}"
+    state: restarted
+  with_items:
+    - nova-api
+    - nova-scheduler
+    - nova-conductor
+    - nova-novncproxy
